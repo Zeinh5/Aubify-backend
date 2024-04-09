@@ -2,6 +2,15 @@ const mongoose = require('mongoose');
 const AutoIncrement = require('mongoose-sequence')(mongoose); // You'll need the mongoose-sequence plugin
 
 const userSchema = new mongoose.Schema({
+    // Existing schema fields...
+    lastPostTimestamps: [{
+      type: Date,
+      default: []
+    }],
+    lastFeedbackTimestamps: [{
+      type: Date,
+      default: []
+    }],
   name: {
     type: String,
     required: true
@@ -10,6 +19,10 @@ const userSchema = new mongoose.Schema({
     type: String,
     required: true,
     unique: true // Ensures that each email is unique
+  },
+  avatarUrl: {
+    type: String,
+    default: '' // Optional: Provide a default avatar URL if you have a default avatar image
   },
   password: {
     type: String,
@@ -32,9 +45,17 @@ const userSchema = new mongoose.Schema({
     type: String,
     unique: true // Ensures the anonymousId is unique
   },
+  isAdmin: {
+    type: Boolean,
+    default: false // Most users are not administrators
+  },
   posts: [{
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Post'
+  }],
+  comments: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Comment' // Assuming 'Comment' is the name of your Comment model
   }]
 });
 
@@ -46,11 +67,6 @@ userSchema.pre('save', function(next) {
   this.anonymousId = `Anonymous#${String(this.anonymousNumber)}`;
   next();
 });
-
-User = mongoose.model('User', userSchema);
-
-module.exports = User;
-
 
 User = mongoose.model('User', userSchema);
 

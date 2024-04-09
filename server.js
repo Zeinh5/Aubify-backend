@@ -2,12 +2,14 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const app = express();
-const PORT = 3000;
+const PORT = 8080;
 const bcrypt = require('bcrypt');
 const nodemailer = require('nodemailer');
 const User = require('./models/User');
 const Post = require('./models/Post'); // Adjust the path as necessary based on your project structure
 const Comment = require('./models/Comment'); // Adjust the path according to your project structure
+const Feedback = require('./models/Feedback'); // Make sure the path matches your project structure
+
 
 
 // Configure Nodemailer
@@ -199,21 +201,25 @@ app.post('/handleSignup', async (req, res) => {
 });
 
 app.post('/posts', async (req, res) => {
-  const { title, content, userEmail } = req.body; // Now expecting userEmail to identify the user
-
+  const { userEmail, title, content } = req.body;
   try {
     const user = await User.findOne({ email: userEmail });
-    if (!user) {
-      return res.status(404).send('User not found');
+    if (!user) return res.status(404).send('User not found');
+
+    if (!canSubmit(user.lastPostTimestamps)) {
+      return res.status(429).send('Post submission limit reached. Please try again later.');
     }
 
-    // Assuming you have a User model where each user has a posts array
-    const newPost = new Post({ title, content, author: user._id }); // Set the author of the post
+    // Create the new post
+    const newPost = new Post({ title, content, author: user._id });
     await newPost.save();
 
-    // Now, add this post to the user's posts array
-    user.posts.push(newPost._id); // Add the post's ID to the user's posts array
-    await user.save(); // Save the user with the updated posts array
+    // Add the post's ObjectId to the user's posts array and update the timestamps
+    user.posts.push(newPost._id);
+    user.lastPostTimestamps = addTimestamp(user.lastPostTimestamps);
+
+    // Save the updated user document
+    await user.save(); // Ensure this is awaited
 
     res.status(201).json(newPost);
   } catch (error) {
@@ -222,24 +228,53 @@ app.post('/posts', async (req, res) => {
   }
 });
 
+
 app.post('/posts/:postId/comments', async (req, res) => {
   try {
-    const postId = req.params.postId;
-    const comment = req.body.comment;
-    const post = await Post.findById(postId);
+    const { postId } = req.params;
+    const { content, userEmail } = req.body;
 
+    if (!content || !userEmail) {
+      return res.status(400).send('Content and userEmail are required.');
+    }
+
+    const user = await User.findOne({ email: userEmail });
+    if (!user) {
+      return res.status(404).send('User not found');
+    }
+
+    const post = await Post.findById(postId);
     if (!post) {
       return res.status(404).send('Post not found');
     }
 
-    post.comments.push(comment);
+    // Retrieve the anonymous ID from the user object
+    const { anonymousId } = user;
+
+    const newComment = await Comment.create({
+      content: content,
+      author: user._id,
+      authorAnonymousId: anonymousId, // Add anonymousId to the comment
+      upvotedBy: [],
+      downvotedBy: []
+    });
+
+    post.comments.push(newComment._id);
     await post.save();
-    res.json(post);
+
+    // Populate comments and their authors
+    await post.populate({
+      path: 'comments',
+      populate: { path: 'author', select: 'email' }
+    });
+
+    res.status(201).json(post);
   } catch (error) {
     console.error('Error adding comment:', error);
     res.status(500).send('Internal server error');
   }
 });
+
 
 // Function to fetch posts sorted by upvotes (relevance)
 const fetchPostsByRelevance = async () => {
@@ -271,24 +306,35 @@ app.get('/posts', async (req, res) => {
   }
 });
 
+
 app.get('/posts/:postId', async (req, res) => {
   try {
-    const postId = req.params.postId;
-    // Ensure 'comments' is populated to fetch actual comment documents
-    const post = await Post.findById(postId).populate('comments');
+    const { postId } = req.params;
+    // Fetch the post by ID
+    const post = await Post.findById(postId)
+      .populate({
+        path: 'comments',
+        options: { sort: { 'upvotes': -1 } }, // Add this line to sort comments by upvotes
+        populate: { path: 'author', select: 'anonymousId' } // Assuming you're populating author details
+      })
+      .populate('author', 'anonymousId') // Populate the post's author's anonymousId
+      .exec();
+
     if (!post) {
       return res.status(404).send('Post not found');
     }
+
     res.json(post);
   } catch (error) {
-    console.error('Error fetching post:', error);
+    console.error('Failed to fetch post:', error);
     res.status(500).send('Internal server error');
   }
 });
 
+
 app.post('/posts/:postId/upvote', async (req, res) => {
   const { postId } = req.params;
-  const {userEmail} = req.body; // Assuming you have user's email from the session or token
+  const { userEmail } = req.body; // Assuming you have user's email from the session or token
 
   try {
     const user = await User.findOne({ email: userEmail });
@@ -302,17 +348,22 @@ app.post('/posts/:postId/upvote', async (req, res) => {
     }
 
     const userId = user._id;
+    // Check if the user already upvoted the post
     if (post.upvotedBy.includes(userId)) {
-      return res.status(409).send('You have already upvoted this post.');
+      // User re-presses upvote, so remove their upvote
+      post.upvotes -= 1;
+      post.upvotedBy = post.upvotedBy.filter(id => id.toString() !== userId.toString());
+    } else {
+      // Add upvote if not already upvoted
+      if (post.downvotedBy.includes(userId)) {
+        // If previously downvoted, first remove the downvote
+        post.downvotes -= 1;
+        post.downvotedBy = post.downvotedBy.filter(id => id.toString() !== userId.toString());
+      }
+      post.upvotes += 1;
+      post.upvotedBy.push(userId);
     }
 
-    if (post.downvotedBy.includes(userId)) {
-      post.downvotes -= 1;
-      post.downvotedBy = post.downvotedBy.filter(id => id.toString() !== userId.toString());
-    }
-
-    post.upvotes += 1;
-    post.upvotedBy.push(userId);
     await post.save();
     res.json(post);
   } catch (error) {
@@ -321,9 +372,10 @@ app.post('/posts/:postId/upvote', async (req, res) => {
   }
 });
 
+
 app.post('/posts/:postId/downvote', async (req, res) => {
   const { postId } = req.params;
-  const {userEmail} = req.body; // Assuming you have user's email from the session or token
+  const { userEmail } = req.body;
 
   try {
     const user = await User.findOne({ email: userEmail });
@@ -337,17 +389,22 @@ app.post('/posts/:postId/downvote', async (req, res) => {
     }
 
     const userId = user._id;
+    // Check if the user already downvoted the post
     if (post.downvotedBy.includes(userId)) {
-      return res.status(409).send('You have already downvoted this post.');
+      // User re-presses downvote, so remove their downvote
+      post.downvotes -= 1;
+      post.downvotedBy = post.downvotedBy.filter(id => id.toString() !== userId.toString());
+    } else {
+      // Add downvote if not already downvoted
+      if (post.upvotedBy.includes(userId)) {
+        // If previously upvoted, first remove the upvote
+        post.upvotes -= 1;
+        post.upvotedBy = post.upvotedBy.filter(id => id.toString() !== userId.toString());
+      }
+      post.downvotes += 1;
+      post.downvotedBy.push(userId);
     }
 
-    if (post.upvotedBy.includes(userId)) {
-      post.upvotes -= 1;
-      post.upvotedBy = post.upvotedBy.filter(id => id.toString() !== userId.toString());
-    }
-
-    post.downvotes += 1;
-    post.downvotedBy.push(userId);
     await post.save();
     res.json(post);
   } catch (error) {
@@ -356,8 +413,10 @@ app.post('/posts/:postId/downvote', async (req, res) => {
   }
 });
 
-app.post('/posts/:postId/comments/:commentIndex/upvote', async (req, res) => {
-  const { postId, commentIndex } = req.params;
+
+// Endpoint for upvoting a comment
+app.post('/posts/:postId/comments/:commentId/upvote', async (req, res) => {
+  const { postId, commentId } = req.params;
   const { userEmail } = req.body;
 
   try {
@@ -366,41 +425,39 @@ app.post('/posts/:postId/comments/:commentIndex/upvote', async (req, res) => {
       return res.status(404).send('User not found');
     }
 
-    const post = await Post.findById(postId);
-    if (!post) {
-      return res.status(404).send('Post not found');
-    }
-
-    const comment = post.comments[commentIndex];
+    const comment = await Comment.findById(commentId);
     if (!comment) {
       return res.status(404).send('Comment not found');
     }
 
-    const userId = user._id.toString();
-    const alreadyUpvoted = comment.upvotedBy.includes(userId);
-    const alreadyDownvoted = comment.downvotedBy.includes(userId);
-
-    if (!alreadyUpvoted) {
-      if (alreadyDownvoted) {
-        // Remove from downvotedBy and decrement downvotes
+    const userId = user._id;
+    if (comment.upvotedBy.includes(userId)) {
+      // User re-presses upvote, so remove their upvote
+      comment.upvotes -= 1;
+      comment.upvotedBy.pull(userId);
+    } else {
+      // Add upvote if not already upvoted
+      if (comment.downvotedBy.includes(userId)) {
+        // If previously downvoted, first remove the downvote
         comment.downvotes -= 1;
-        comment.downvotedBy = comment.downvotedBy.filter(id => id.toString() !== userId);
+        comment.downvotedBy.pull(userId);
       }
-      // Add to upvotedBy and increment upvotes
       comment.upvotes += 1;
       comment.upvotedBy.push(userId);
     }
-    post.comments.sort((a, b) => b.upvotes - a.upvotes);
-    await post.save();
-    res.json(post);
+
+    await comment.save();
+    res.status(200).json(comment);
   } catch (error) {
     console.error('Error upvoting comment:', error);
     res.status(500).send('Internal server error');
   }
 });
 
-app.post('/posts/:postId/comments/:commentIndex/downvote', async (req, res) => {
-  const { postId, commentIndex } = req.params;
+
+// Endpoint for downvoting a comment
+app.post('/posts/:postId/comments/:commentId/downvote', async (req, res) => {
+  const { postId, commentId } = req.params;
   const { userEmail } = req.body;
 
   try {
@@ -409,38 +466,38 @@ app.post('/posts/:postId/comments/:commentIndex/downvote', async (req, res) => {
       return res.status(404).send('User not found');
     }
 
-    const post = await Post.findById(postId);
-    if (!post) {
-      return res.status(404).send('Post not found');
-    }
-
-    const comment = post.comments[commentIndex];
+    const comment = await Comment.findById(commentId);
     if (!comment) {
       return res.status(404).send('Comment not found');
     }
 
-    const userId = user._id.toString();
-    const alreadyUpvoted = comment.upvotedBy.includes(userId);
-    const alreadyDownvoted = comment.downvotedBy.includes(userId);
-
-    if (!alreadyDownvoted) {
-      if (alreadyUpvoted) {
-        // Remove from upvotedBy and decrement upvotes
+    const userId = user._id;
+    if (comment.downvotedBy.includes(userId)) {
+      // User re-presses downvote, so remove their downvote
+      comment.downvotes -= 1;
+      comment.downvotedBy.pull(userId);
+    } else {
+      // Add downvote if not already downvoted
+      if (comment.upvotedBy.includes(userId)) {
+        // If previously upvoted, first remove the upvote
         comment.upvotes -= 1;
-        comment.upvotedBy = comment.upvotedBy.filter(id => id.toString() !== userId);
+        comment.upvotedBy.pull(userId);
       }
-      // Add to downvotedBy and increment downvotes
       comment.downvotes += 1;
       comment.downvotedBy.push(userId);
     }
-    post.comments.sort((a, b) => b.upvotes - a.upvotes);
-    await post.save();
-    res.json(post);
+
+    await comment.save();
+    res.status(200).json(comment);
   } catch (error) {
     console.error('Error downvoting comment:', error);
     res.status(500).send('Internal server error');
   }
 });
+
+
+
+
 app.post('/checkCurrentPassword', async (req, res) => {
   const { email, password } = req.body;
   const user = await User.findOne({ email: email });
@@ -501,6 +558,216 @@ app.get('/user/posts', async (req, res) => {
     res.json(posts);
   } catch (error) {
     console.error('Failed to fetch user posts:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+app.get('/posts/:postId/author/anonymousId', async (req, res) => {
+  const { postId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(postId)) {
+    return res.status(400).send({ message: "Invalid Post ID format." });
+  }
+
+  try {
+    // Fetch the post by ID to get the author field
+    const post = await findPostById(postId);
+    if (!post) {
+      return res.status(404).json({ message: 'Post not found' });
+    }
+
+    // The author is populated, so you have access to all user fields
+    const author = post.author;
+    if (!author) {
+      return res.status(404).json({ message: 'Author not found' });
+    }
+
+    // Respond with the anonymous ID, ignoring the submission limit
+    res.json({ anonymousId: author.anonymousId });
+  } catch (error) {
+    console.error(`Error fetching author's anonymous ID:`, error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+
+async function findPostById(postId) {
+  try {
+    const post = await Post.findById(postId)
+      .populate('author')
+
+    if (!post) {
+      console.log('No post found with the given ID.');
+      return null;
+    }
+
+    return post;
+  } catch (error) {
+    console.error('Error finding post by ID:', error);
+    throw error; // Rethrowing the error might be helpful if you want calling functions to handle it
+  }
+}
+
+app.get('/user/avatar', async (req, res) => {
+  const { email } = req.query;
+
+  try {
+    const user = await User.findOne({ email: email }).exec();
+    if (!user) {
+      return res.status(404).send('User not found');
+    }
+    res.json({ avatarUrl: user.avatarUrl }); // Assuming user document has an avatarUrl field
+  } catch (error) {
+    console.error('Error fetching user avatar:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+app.post('/user/update-avatar', async (req, res) => {
+  const { email, avatarUrl } = req.body;
+
+  try {
+    const user = await User.findOneAndUpdate({ email: email }, { avatarUrl: avatarUrl }, { new: true });
+    if (!user) {
+      return res.status(404).send('User not found');
+    }
+    res.send('Avatar updated successfully');
+  } catch (error) {
+    console.error('Error updating avatar:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+app.get('/user/date-created', async (req, res) => {
+  const { email } = req.query;
+
+  try {
+    const user = await User.findOne({ email: email }).exec();
+    if (!user) {
+      return res.status(404).send('User not found');
+    }
+    
+    const accountCreated = user.accountCreated;
+
+    const month = (accountCreated.getMonth() + 1).toString().padStart(2, '0'); // Adding 1 to get the correct month index
+    const day = accountCreated.getDate().toString().padStart(2, '0');
+    const year = accountCreated.getFullYear();
+
+    // Format the date as mm-dd-yyyy
+    const formattedDate = `${month}/${day}/${year}`;
+
+    res.json({ dateCreated: formattedDate });
+  } catch (error) {
+    console.error('Failed to fetch date created:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+// Route to fetch feedback list
+app.get('/getFeedbackList', async (req, res) => {
+  try {
+    const feedbackList = await Feedback.find().sort({ createdAt: -1 }); // Fetch all feedback, newest first
+    res.json(feedbackList);
+  } catch (error) {
+    console.error('Error fetching feedback list:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Route to send (save) feedback
+app.post('/sendFeedback', async (req, res) => {
+  const { email, message } = req.body;
+  try {
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).send('User not found');
+
+    if (!canSubmit(user.lastFeedbackTimestamps)) {
+      return res.status(429).send('Feedback submission limit reached. Please try again later.');
+    }
+
+    const newFeedback = new Feedback({ email, message });
+    await newFeedback.save();
+
+    user.lastFeedbackTimestamps = addTimestamp(user.lastFeedbackTimestamps);
+    await user.save(); // Make sure to await the save operation
+
+    res.status(201).json({ message: 'Feedback sent successfully.' });
+  } catch (error) {
+    console.error('Error sending feedback:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+
+// Utility functions (Place these inside your main server file or a separate utilities file)
+
+const MAX_SUBMISSIONS = 4;
+const SUBMISSION_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+// Removes timestamps older than 24 hours and checks if a new submission is allowed
+const canSubmit = (timestamps) => {
+  const now = new Date();
+  const recentTimestamps = timestamps.filter(timestamp => now - timestamp < SUBMISSION_WINDOW_MS);
+  return recentTimestamps.length < MAX_SUBMISSIONS;
+};
+
+// Add a new timestamp to the array (ensuring it doesn't exceed the max length)
+const addTimestamp = (timestamps) => {
+  const now = new Date();
+  timestamps.push(now);
+  // Ensure we only keep the relevant timestamps within the 24-hour window
+  return timestamps.slice(-MAX_SUBMISSIONS);
+};
+
+// Assuming you have an authentication middleware that sets `req.user`
+app.get('/checkAdminStatus', async (req, res) => {
+  const { userEmail } = req.query; // Get the userEmail from query parameters
+
+  try {
+    const user = await User.findOne({ email: userEmail });
+    if (!user) {
+      return res.status(404).send('User not found');
+    }
+    res.json({ isAdmin: user.isAdmin });
+  } catch (error) {
+    console.error('Error checking admin status:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+// Assuming you have a Post model imported at the top
+// const Post = require('./models/Post');
+
+app.get('/reportedPosts', async (req, res) => {
+  try {
+    // Fetch all posts where 'reported' is true
+    const reportedPosts = await Post.find({ reported: true }).select('title _id').exec();
+    res.json(reportedPosts);
+  } catch (error) {
+    console.error('Failed to fetch reported posts:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+app.post('/posts/:postId/report', async (req, res) => {
+  const { postId } = req.params;
+
+  try {
+    // Find the post by ID
+    const post = await Post.findById(postId);
+    if (!post) {
+      return res.status(404).send('Post not found');
+    }
+
+    // Toggle the 'reported' status
+    post.reported = !post.reported;
+    await post.save();
+
+    // Respond indicating whether the post was reported or the report was removed
+    const action = post.reported ? "add" : "remove";
+    res.json({ action: action, message: `Report ${action === "add" ? "added" : "removed"} successfully.` });
+  } catch (error) {
+    console.error('Error toggling report status:', error);
     res.status(500).send('Internal server error');
   }
 });
