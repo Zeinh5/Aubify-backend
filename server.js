@@ -17,7 +17,7 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 // Middleware
 app.use(express.json()); // Parse JSON requests
-app.use(cors({origin: "http://localhost:3000"})); // Enable CORS for all routes
+app.use(cors()); // Enable CORS for all routes
 
 // MongoDB connection
 mongoose.connect('mongodb+srv://admin:admin271*@cluster.wtbgcs2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster', {
